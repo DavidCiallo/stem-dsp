@@ -1,0 +1,40 @@
+name: audio-service
+
+services:
+  # 分轨引擎，从官方仓库源码构建。GHCR 预构建镜像目前匿名拉取不到。
+  stemdeck:
+    build:
+      context: https://github.com/stemdeckapp/stemdeck.git
+      dockerfile: build/Dockerfile
+    container_name: stemdeck
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./jobs:/app/jobs
+      - stemdeck-cache:/cache
+    restart: unless-stopped
+
+    # NVIDIA GPU 用这段，前提已装好驱动和 NVIDIA Container Toolkit
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  dsp:
+    build:
+      context: .
+    container_name: dsp
+    ports:
+      - "8765:8765"
+    environment:
+      DSP_TOKEN: ${DSP_TOKEN:-5b7372c99b953139a02e6b9dd1020424}
+      STEMDECK_URL: http://stemdeck:8000
+    depends_on:
+      - stemdeck
+    restart: unless-stopped
+
+volumes:
+  stemdeck-cache:
