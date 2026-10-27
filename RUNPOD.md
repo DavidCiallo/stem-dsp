@@ -5,7 +5,7 @@
 ## 1. 构建镜像
 
 ```sh
-docker build -t stem-dsp-runpod ./runpod
+docker build -f Dockerfile.runpod -t stem-dsp-runpod .
 docker tag stem-dsp-runpod ghcr.io/davidciallo/stem-dsp-runpod:latest
 docker push ghcr.io/davidciallo/stem-dsp-runpod:latest
 ```
