@@ -30,11 +30,14 @@ HOST = os.environ.get("DSP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DSP_PORT", "8765"))
 STEMDECK = os.environ.get("STEMDECK_URL", "https://127.0.0.1:8443").rstrip("/")
 TOKEN = os.environ.get("DSP_TOKEN", "")
+UPLOAD_DIR = os.environ.get("DSP_UPLOAD_DIR") or os.path.join(tempfile.gettempdir(), "dsp-uploads")
 
 # StemDeck 用自签证书，本机通信不走证书链校验
 _SSL = ssl._create_unverified_context()
 
 STEM_NAMES = ("vocals", "drums", "bass", "guitar", "piano", "other")
+# Content-Type 的子类型不是文件后缀，audio/mpeg 存成 .mpeg 会被 StemDeck 拒收
+_UPLOAD_EXT = {"mpeg": "mp3", "x-wav": "wav", "wave": "wav", "x-flac": "flac", "x-m4a": "m4a"}
 POLL_SECONDS = 3
 JOB_TIMEOUT = 1800
 
@@ -161,6 +164,7 @@ DOCS = """<!doctype html>
 <tr><td>GET</td><td>/health</td><td>服务状态</td></tr>
 <tr><td>GET</td><td>/api/docs</td><td>本文档</td></tr>
 <tr><td>GET</td><td>/capabilities</td><td>模块与操作清单</td></tr>
+<tr><td>POST</td><td>/upload</td><td>上传源音频存档</td></tr>
 <tr><td>POST</td><td>/process</td><td>提交处理</td></tr>
 <tr><td>GET</td><td>/task/{taskId}</td><td>任务状态</td></tr>
 <tr><td>GET</td><td>/tasks</td><td>最近任务</td></tr>
@@ -212,6 +216,20 @@ DOCS = """<!doctype html>
 </tbody>
 </table>
 
+<div class="endpoint"><span class="m post">POST</span><h2>/upload</h2></div>
+<p class="note">需要鉴权。请求体为音频原始字节，<code>Content-Type</code> 决定存档扩展名。返回的 <code>fileId</code> 可在 <code>/process</code> 中反复使用，之后的调用不再传输音频。</p>
+<h3>响应</h3>
+<table>
+<thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>ok</td><td>boolean</td><td>上传成功</td></tr>
+<tr><td>fileId</td><td>string</td><td>存档标识，32 位十六进制</td></tr>
+<tr><td>bytes</td><td>number</td><td>已接收字节数</td></tr>
+<tr><td>format</td><td>string</td><td>存档扩展名</td></tr>
+<tr><td>duration</td><td>number</td><td>音频时长，秒</td></tr>
+</tbody>
+</table>
+
 <div class="endpoint"><span class="m post">POST</span><h2>/process</h2></div>
 <p class="note">需要鉴权。同步处理，完成或失败后返回。带 <code>module</code> 执行本地模块，不带 <code>module</code> 执行分离。</p>
 <h3>请求字段</h3>
@@ -220,6 +238,7 @@ DOCS = """<!doctype html>
 <tbody>
 <tr><td>module</td><td>string</td><td class="req">否</td><td>本地引擎模块名，取值见 <code>/capabilities</code></td></tr>
 <tr><td>params</td><td>object</td><td class="req">否</td><td>模块参数，缺省项取 default</td></tr>
+<tr><td>fileId</td><td>string</td><td class="req">否</td><td>已存档音频的标识，由 <code>/upload</code> 返回</td></tr>
 <tr><td>sourceUrl</td><td>string</td><td class="req">否</td><td>源音频 HTTP(S) 地址，由服务端下载</td></tr>
 <tr><td>path</td><td>string</td><td class="req">否</td><td>服务端本机文件路径</td></tr>
 <tr><td>audioBase64</td><td>string</td><td class="req">否</td><td>源音频 Base64</td></tr>
@@ -231,7 +250,7 @@ DOCS = """<!doctype html>
 <tr><td>async</td><td>boolean</td><td class="req">否</td><td>true 时立即返回任务号，默认 false</td></tr>
 </tbody>
 </table>
-<p class="note"><code>sourceUrl</code>、<code>path</code>、<code>audioBase64</code> 三选一。模块的 <code>needsInput</code> 为 true 时必须提供其一。</p>
+<p class="note"><code>fileId</code>、<code>sourceUrl</code>、<code>path</code>、<code>audioBase64</code> 四选一。模块的 <code>needsInput</code> 为 true 时必须提供其一。</p>
 
 <h3>响应 · 本地模块</h3>
 <table>
@@ -355,6 +374,14 @@ def capabilities():
 
 
 def _resolve_in(body):
+    if body.get("fileId"):
+        file_id = str(body["fileId"])
+        if not re.fullmatch(r"[0-9a-f]{32}", file_id):
+            raise ValueError(f"fileId 无效：{file_id}")
+        hits = [f for f in os.listdir(UPLOAD_DIR) if f.startswith(file_id + ".")] if os.path.isdir(UPLOAD_DIR) else []
+        if not hits:
+            raise ValueError(f"找不到存档文件：{file_id}")
+        return os.path.join(UPLOAD_DIR, hits[0])
     if body.get("sourceUrl"):
         url = body["sourceUrl"]
         suffix = os.path.splitext(url.split("?")[0])[1] or "." + (body.get("format") or "wav")
@@ -372,7 +399,7 @@ def _resolve_in(body):
         with os.fdopen(fd, "wb") as f:
             f.write(base64.b64decode(body["audioBase64"]))
         return path
-    raise ValueError("需要 sourceUrl、path 或 audioBase64 之一")
+    raise ValueError("需要 fileId、sourceUrl、path 或 audioBase64 之一")
 
 
 def _upload(path, url, method, ctype):
@@ -571,6 +598,30 @@ class Handler(BaseHTTPRequestHandler):
         # 有的客户端写文件会带 BOM，严格 utf-8 会直接拒掉
         return json.loads(self.rfile.read(n).decode("utf-8-sig"))
 
+    def _receive(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            raise ValueError("空请求体")
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        ext = ctype.split("/")[-1]
+        if not re.fullmatch(r"[a-z0-9]{1,8}", ext) or ext in ("octet-stream", "json", "plain"):
+            raise ValueError(f"Content-Type 需为音频类型，例如 audio/mpeg，当前 {ctype or '未设置'}")
+        ext = _UPLOAD_EXT.get(ext, ext)
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        file_id = uuid.uuid4().hex
+        dest = os.path.join(UPLOAD_DIR, f"{file_id}.{ext}")
+        left = n
+        with open(dest, "wb") as f:
+            while left:
+                chunk = self.rfile.read(min(left, 1 << 20))
+                if not chunk:
+                    break
+                f.write(chunk)
+                left -= len(chunk)
+        info = sf.info(dest)
+        return {"ok": True, "fileId": file_id, "bytes": n - left, "format": ext,
+                "duration": round(info.frames / info.samplerate, 3)}
+
     def _authed(self):
         if not TOKEN:
             return True
@@ -641,12 +692,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/process", "/separate"):
+        if path not in ("/process", "/separate", "/upload"):
             return self._json(404, {"ok": False, "error": f"unknown path {path}"})
         if not self._authed():
             return self._json(401, {"ok": False, "error": "missing or wrong token"})
         try:
-            self._json(200, _start(self._body()))
+            self._json(200, self._receive() if path == "/upload" else _start(self._body()))
         except Exception as e:
             sys.stderr.write(traceback.format_exc())
             self._json(400, {"ok": False, "error": str(e)})
