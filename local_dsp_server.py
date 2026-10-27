@@ -188,7 +188,6 @@ DOCS = """<!doctype html>
 <tr><td>GET</td><td>/task/{taskId}</td><td>任务状态</td></tr>
 <tr><td>GET</td><td>/tasks</td><td>最近任务</td></tr>
 <tr><td>GET</td><td>/result/{taskId}/out.wav</td><td>本地模块输出</td></tr>
-<tr><td>GET</td><td>/result/{taskId}/all.zip</td><td>分轨打包</td></tr>
 <tr><td>GET</td><td>/result/{taskId}/{stem}.wav</td><td>单个音轨</td></tr>
 </tbody>
 </table>
@@ -323,8 +322,6 @@ DOCS = """<!doctype html>
 <tr><td>stems[].name</td><td>string</td><td>音轨名</td></tr>
 <tr><td>stems[].bytes</td><td>number</td><td>文件字节数</td></tr>
 <tr><td>stems[].url</td><td>string</td><td>下载地址，配置了 OSS 时为预签名 URL</td></tr>
-<tr><td>zip.bytes</td><td>number</td><td>打包文件字节数</td></tr>
-<tr><td>zip.url</td><td>string</td><td>打包下载路径</td></tr>
 <tr><td>deduplicated</td><td>boolean</td><td>是否为重复 taskId 的历史结果</td></tr>
 <tr><td>uploadUrl</td><td>string</td><td>上传地址，仅在传入 uploadUrl 时出现</td></tr>
 <tr><td>uploadStatus</td><td>number</td><td>上传返回的 HTTP 状态码</td></tr>
@@ -363,9 +360,6 @@ DOCS = """<!doctype html>
 
 <div class="endpoint"><span class="m get">GET</span><h2>/result/{taskId}/out.wav</h2></div>
 <p class="note">需要鉴权。本地模块输出音频，<code>Content-Type: audio/wav</code>。</p>
-
-<div class="endpoint"><span class="m get">GET</span><h2>/result/{taskId}/all.zip</h2></div>
-<p class="note">需要鉴权。分离结果打包，<code>Content-Type: application/zip</code>。</p>
 
 <div class="endpoint"><span class="m get">GET</span><h2>/result/{taskId}/{stem}.wav</h2></div>
 <p class="note">需要鉴权。单个音轨，<code>Content-Type: audio/wav</code>。<code>stem</code> 取值见 <code>/capabilities</code> 的 <code>operations[].stems</code>。</p>
@@ -483,11 +477,6 @@ def _publish_oss(task_id, workdir, result):
         bucket.put_object_from_file(key, os.path.join(workdir, stem["name"] + ".wav"),
                                     headers={"Content-Type": "audio/wav"})
         stem["url"] = signer.sign_url("GET", key, OSS_EXPIRES)
-    zip_path = os.path.join(workdir, "all.zip")
-    if os.path.isfile(zip_path):
-        key = f"{prefix}/all.zip"
-        bucket.put_object_from_file(key, zip_path, headers={"Content-Type": "application/zip"})
-        result["zip"]["url"] = signer.sign_url("GET", key, OSS_EXPIRES)
     return {"bucket": OSS_BUCKET, "prefix": prefix}
 
 
@@ -578,10 +567,6 @@ def _demucs_separate(task_id, src, workdir, wanted):
         raise RuntimeError(f"demucs 没有产出分轨，检查模型名 {DEMUCS_MODEL}")
     stems.sort(key=lambda s: STEM_NAMES.index(s["name"]))
 
-    zip_path = os.path.join(workdir, "all.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:
-        for s in stems:
-            z.write(os.path.join(workdir, s["name"] + ".wav"), s["name"] + ".wav")
     return {
         "ok": True,
         "taskId": task_id,
@@ -589,8 +574,6 @@ def _demucs_separate(task_id, src, workdir, wanted):
         "operation": "separate",
         "duration": round(sf.info(os.path.join(workdir, stems[0]["name"] + ".wav")).duration, 3),
         "stems": stems,
-        "zip": {"bytes": _bytes(zip_path), "url": f"/result/{task_id}/all.zip"},
-        "__upload": (zip_path, "application/zip"),
     }
 
 
@@ -643,7 +626,7 @@ def _run_separate(task_id, body, workdir):
         time.sleep(POLL_SECONDS)
 
     _progress(task_id, stage="Fetching stems...")
-    stems, zip_path = _collect(task_id, job_id, wanted, workdir)
+    stems, _ = _collect(task_id, job_id, wanted, workdir)
     return {
         "ok": True,
         "taskId": task_id,
@@ -652,8 +635,6 @@ def _run_separate(task_id, body, workdir):
         "jobId": job_id,
         "duration": info.get("duration"),
         "stems": stems,
-        "zip": {"bytes": _bytes(zip_path), "url": f"/result/{task_id}/all.zip"},
-        "__upload": (zip_path, "application/zip"),
     }
 
 
@@ -830,9 +811,7 @@ class Handler(BaseHTTPRequestHandler):
             if task_id not in _jobs:
                 return self._json(404, {"ok": False, "error": f"unknown task {task_id}"})
             workdir = os.path.join(tempfile.gettempdir(), "dsp-" + task_id)
-            if name == "all.zip":
-                target, ctype = os.path.join(workdir, "all.zip"), "application/zip"
-            elif name == "out.wav":
+            if name == "out.wav":
                 target, ctype = os.path.join(workdir, "out.wav"), "audio/wav"
             elif re.fullmatch(r"[a-z]+\.wav", name):
                 stem = _stem_key(name)
