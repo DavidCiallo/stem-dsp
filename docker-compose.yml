@@ -1,4 +1,4 @@
-name: audio-service
+name: stem-dsp
 
 services:
   # 分轨引擎，从官方仓库源码构建。GHCR 预构建镜像目前匿名拉取不到。
