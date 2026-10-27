@@ -144,7 +144,7 @@ DOCS = """<!doctype html>
 
 <header>
   <h1>本地音频服务 API</h1>
-  <div class="sub">Base URL <code>http://8.140.213.167:58765</code> · JSON over HTTP · 单文件整段处理</div>
+  <div class="sub">JSON over HTTP · 路径相对于服务根地址 · 单文件整段处理</div>
 </header>
 
 <h2>鉴权</h2>
