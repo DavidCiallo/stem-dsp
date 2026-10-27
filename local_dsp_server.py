@@ -46,6 +46,8 @@ OSS_AK = os.environ.get("DSP_OSS_AK", "")
 OSS_SK = os.environ.get("DSP_OSS_SK", "")
 OSS_PREFIX = os.environ.get("DSP_OSS_PREFIX", "stems")
 OSS_EXPIRES = int(os.environ.get("DSP_OSS_EXPIRES", str(7 * 24 * 3600)))
+# 上传走内网 endpoint，但签名必须用公网地址，否则外部客户端解析不了
+OSS_PUBLIC_ENDPOINT = os.environ.get("DSP_OSS_PUBLIC_ENDPOINT", "")
 
 # StemDeck 用自签证书，本机通信不走证书链校验
 _SSL = ssl._create_unverified_context()
@@ -445,6 +447,7 @@ def _upload(path, url, method, ctype):
 
 
 _oss_bucket_cache = [None]
+_oss_signer_cache = [None]
 
 
 def _oss_bucket():
@@ -458,20 +461,33 @@ def _oss_bucket():
     return _oss_bucket_cache[0]
 
 
+def _oss_signer():
+    """只用来生成预签名地址，endpoint 换成公网，签名本身跟 host 无关。"""
+    if _oss_signer_cache[0] is None:
+        import oss2
+
+        endpoint = OSS_PUBLIC_ENDPOINT or OSS_ENDPOINT.replace("-internal", "")
+        if "://" not in endpoint:
+            endpoint = "https://" + endpoint
+        _oss_signer_cache[0] = oss2.Bucket(oss2.Auth(OSS_AK, OSS_SK), endpoint, OSS_BUCKET)
+    return _oss_signer_cache[0]
+
+
 def _publish_oss(task_id, workdir, result):
     """分轨和 zip 推进 OSS，把 url 换成预签名地址。容器里因此不需要保留结果文件。"""
     bucket = _oss_bucket()
+    signer = _oss_signer()
     prefix = f"{OSS_PREFIX}/{task_id}"
     for stem in result.get("stems") or []:
         key = f"{prefix}/{stem['name']}.wav"
         bucket.put_object_from_file(key, os.path.join(workdir, stem["name"] + ".wav"),
                                     headers={"Content-Type": "audio/wav"})
-        stem["url"] = bucket.sign_url("GET", key, OSS_EXPIRES)
+        stem["url"] = signer.sign_url("GET", key, OSS_EXPIRES)
     zip_path = os.path.join(workdir, "all.zip")
     if os.path.isfile(zip_path):
         key = f"{prefix}/all.zip"
         bucket.put_object_from_file(key, zip_path, headers={"Content-Type": "application/zip"})
-        result["zip"]["url"] = bucket.sign_url("GET", key, OSS_EXPIRES)
+        result["zip"]["url"] = signer.sign_url("GET", key, OSS_EXPIRES)
     return {"bucket": OSS_BUCKET, "prefix": prefix}
 
 
