@@ -322,6 +322,9 @@ DOCS = """<!doctype html>
 <tr><td>stems[].name</td><td>string</td><td>音轨名</td></tr>
 <tr><td>stems[].bytes</td><td>number</td><td>文件字节数</td></tr>
 <tr><td>stems[].url</td><td>string</td><td>下载地址，配置了 OSS 时为预签名 URL</td></tr>
+<tr><td>oss</td><td>object</td><td>结果在对象存储中的位置</td></tr>
+<tr><td>oss.bucket</td><td>string</td><td>存储空间名称</td></tr>
+<tr><td>oss.prefix</td><td>string</td><td>对象前缀，形如 <code>stems/{taskId}</code></td></tr>
 <tr><td>deduplicated</td><td>boolean</td><td>是否为重复 taskId 的历史结果</td></tr>
 <tr><td>uploadUrl</td><td>string</td><td>上传地址，仅在传入 uploadUrl 时出现</td></tr>
 <tr><td>uploadStatus</td><td>number</td><td>上传返回的 HTTP 状态码</td></tr>
