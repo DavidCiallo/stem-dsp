@@ -8,6 +8,7 @@
 
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -180,6 +181,7 @@ DOCS = """<!doctype html>
 <tr><td>GET</td><td>/capabilities</td><td>模块与操作清单</td></tr>
 <tr><td>POST</td><td>/upload</td><td>上传源音频存档</td></tr>
 <tr><td>POST</td><td>/process</td><td>提交处理</td></tr>
+<tr><td>POST</td><td>/warmup</td><td>预热：跑一次 1 秒的分离</td></tr>
 <tr><td>GET</td><td>/task/{taskId}</td><td>任务状态</td></tr>
 <tr><td>GET</td><td>/tasks</td><td>最近任务</td></tr>
 <tr><td>GET</td><td>/result/{taskId}/out.wav</td><td>本地模块输出</td></tr>
@@ -202,6 +204,19 @@ DOCS = """<!doctype html>
 <tr><td>device</td><td>string</td><td>推理设备</td></tr>
 <tr><td>tasks</td><td>number</td><td>已登记任务数</td></tr>
 <tr><td>engine_error</td><td>string</td><td>分离引擎不可达时的原因</td></tr>
+</tbody>
+</table>
+
+<div class="endpoint"><span class="m post">POST</span><h2>/warmup</h2></div>
+<p class="note">需要鉴权。跑一次 1 秒音频的完整分离，把 torch、CUDA、模型加载这些一次性初始化做完，之后的任务只剩推理。容器首次启动要跑 50 秒左右，模型已加载时几秒返回。</p>
+<h3>响应</h3>
+<table>
+<thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>ok</td><td>boolean</td><td>预热成功</td></tr>
+<tr><td>model</td><td>string</td><td>分轨模型</td></tr>
+<tr><td>device</td><td>string</td><td>推理设备</td></tr>
+<tr><td>seconds</td><td>number</td><td>本次预热耗时</td></tr>
 </tbody>
 </table>
 
@@ -560,6 +575,31 @@ def _demucs_separate(task_id, src, workdir, wanted):
     }
 
 
+def _warmup():
+    """跑一次 1 秒的分离，把 torch、CUDA、模型、显存全部热起来。
+
+    冷启动那 50 秒基本都花在这些初始化上，跑完这一次，后面每单就只剩推理。
+    """
+    if not DEMUCS_PYTHON:
+        raise RuntimeError("warmup 只对 demucs 引擎有效")
+    started = time.time()
+    work = tempfile.mkdtemp(prefix="dsp-warmup-")
+    try:
+        src = os.path.join(work, "warmup.wav")
+        # 纯静音会让 demucs 的归一化除以零，用极低幅度的正弦代替
+        tone = [[0.01 * math.sin(2 * math.pi * 440 * i / 44100)] * 2 for i in range(44100)]
+        sf.write(src, tone, 44100, subtype="PCM_16")
+        cmd = [DEMUCS_PYTHON, "-m", "demucs", "-n", DEMUCS_MODEL, "-d", DEMUCS_DEVICE,
+               "-o", os.path.join(work, "out"), src]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=JOB_TIMEOUT)
+        if proc.returncode != 0:
+            raise RuntimeError(f"demucs 退出码 {proc.returncode}：{proc.stderr.strip()[-400:]}")
+        return {"ok": True, "model": DEMUCS_MODEL, "device": DEMUCS_DEVICE,
+                "seconds": round(time.time() - started, 2)}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _run_separate(task_id, body, workdir):
     _progress(task_id, status="running", stage="Downloading source...")
     src = _resolve_in(body)
@@ -791,11 +831,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/process", "/separate", "/upload"):
+        if path not in ("/process", "/separate", "/upload", "/warmup"):
             return self._json(404, {"ok": False, "error": f"unknown path {path}"})
         if not self._authed():
             return self._json(401, {"ok": False, "error": "missing or wrong token"})
         try:
+            if path == "/warmup":
+                return self._json(200, _warmup())
             self._json(200, self._receive() if path == "/upload" else _start(self._body()))
         except Exception as e:
             sys.stderr.write(traceback.format_exc())
