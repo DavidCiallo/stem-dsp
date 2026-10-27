@@ -67,9 +67,13 @@ def _upload(path, url, method):
 
 def handler(job):
     inp = job.get("input") or {}
+    started = time.time()
+    # 模型在模块导入时已经加载完，走到这里说明 worker 已经热了
+    if inp.get("warmup"):
+        return {"ok": True, "warmup": True, "model": MODEL_NAME, "device": DEVICE,
+                "seconds": round(time.time() - started, 3)}
     wanted = [s for s in (inp.get("stems") or []) if s in STEMS]
     shifts = 2 if inp.get("quality") == "best" else 1
-    started = time.time()
 
     with tempfile.TemporaryDirectory() as work:
         if inp.get("sourceUrl"):
