@@ -2,8 +2,8 @@
 
     python local_dsp_server.py            # 默认 127.0.0.1:8765
 
-StemDeck 需要先跑起来（StemDeck.exe，监听 https://127.0.0.1:8443）。
-本服务只做转发和任务管理，分轨本身全在 StemDeck 里完成。
+设了 DSP_DEMUCS_PYTHON 就直接调 demucs，只出分轨；否则转发给 StemDeck
+（StemDeck.exe，监听 https://127.0.0.1:8443），分轨在那边完成。
 """
 
 import base64
@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -31,6 +32,11 @@ PORT = int(os.environ.get("DSP_PORT", "8765"))
 STEMDECK = os.environ.get("STEMDECK_URL", "https://127.0.0.1:8443").rstrip("/")
 TOKEN = os.environ.get("DSP_TOKEN", "")
 UPLOAD_DIR = os.environ.get("DSP_UPLOAD_DIR") or os.path.join(tempfile.gettempdir(), "dsp-uploads")
+
+# 指向装了 torch+demucs 的解释器就绕开 StemDeck 整条 pipeline，只跑分离
+DEMUCS_PYTHON = os.environ.get("DSP_DEMUCS_PYTHON", "")
+DEMUCS_MODEL = os.environ.get("DSP_DEMUCS_MODEL", "htdemucs_6s")
+DEMUCS_DEVICE = os.environ.get("DSP_DEMUCS_DEVICE", "cuda")
 
 # StemDeck 用自签证书，本机通信不走证书链校验
 _SSL = ssl._create_unverified_context()
@@ -181,9 +187,9 @@ DOCS = """<!doctype html>
 <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
 <tbody>
 <tr><td>ok</td><td>boolean</td><td>服务可用</td></tr>
-<tr><td>engine</td><td>string</td><td>分离引擎标识，固定 <code>stemdeck</code></td></tr>
-<tr><td>engine_ok</td><td>boolean</td><td>分离引擎连通状态</td></tr>
-<tr><td>version</td><td>string</td><td>分离引擎版本</td></tr>
+<tr><td>engine</td><td>string</td><td>分离引擎标识：<code>demucs</code> 或 <code>stemdeck</code></td></tr>
+<tr><td>engine_ok</td><td>boolean</td><td>分离引擎可用状态</td></tr>
+<tr><td>version</td><td>string</td><td>StemDeck 版本，仅 <code>stemdeck</code> 引擎返回</td></tr>
 <tr><td>model</td><td>string</td><td>分轨模型</td></tr>
 <tr><td>device</td><td>string</td><td>推理设备</td></tr>
 <tr><td>tasks</td><td>number</td><td>已登记任务数</td></tr>
@@ -282,7 +288,7 @@ DOCS = """<!doctype html>
 <tr><td>taskId</td><td>string</td><td>任务标识</td></tr>
 <tr><td>status</td><td>string</td><td>固定 <code>done</code></td></tr>
 <tr><td>operation</td><td>string</td><td>固定 <code>separate</code></td></tr>
-<tr><td>jobId</td><td>string</td><td>分离引擎任务号</td></tr>
+<tr><td>jobId</td><td>string</td><td>分离引擎任务号，仅 <code>stemdeck</code> 引擎返回</td></tr>
 <tr><td>duration</td><td>number</td><td>源音频时长，秒</td></tr>
 <tr><td>seconds</td><td>number</td><td>处理耗时，秒</td></tr>
 <tr><td>stems</td><td>array</td><td>音轨列表</td></tr>
@@ -308,7 +314,7 @@ DOCS = """<!doctype html>
 <tr><td>status</td><td>string</td><td><code>queued</code> / <code>running</code> / <code>done</code> / <code>failed</code></td></tr>
 <tr><td>stage</td><td>string</td><td>当前阶段</td></tr>
 <tr><td>progress</td><td>number</td><td>进度，0 到 1</td></tr>
-<tr><td>jobId</td><td>string</td><td>分离引擎任务号，分离任务提供</td></tr>
+<tr><td>jobId</td><td>string</td><td>分离引擎任务号，仅 <code>stemdeck</code> 引擎的分离任务提供</td></tr>
 <tr><td>created</td><td>number</td><td>创建时间，Unix 秒</td></tr>
 <tr><td>elapsed</td><td>number</td><td>总耗时，秒</td></tr>
 <tr><td>result</td><td>object</td><td>完成后与 <code>/process</code> 响应相同</td></tr>
@@ -354,7 +360,7 @@ DOCS = """<!doctype html>
 <tr><td>输出格式</td><td>WAV，24-bit；<code>Dither</code> 指定 16 bit 时输出 16-bit</td></tr>
 <tr><td>采样率</td><td><code>Resample</code> 与 <code>Signal Generator</code> 决定输出采样率，其余模块沿用源文件采样率</td></tr>
 <tr><td>声道</td><td>沿用源文件声道数；<code>Signal Generator</code> 固定单声道</td></tr>
-<tr><td>分离限制</td><td>上传上限 400 MB，时长上限 1200 秒</td></tr>
+<tr><td>分离限制</td><td><code>stemdeck</code> 引擎受 StemDeck 的上传 400 MB、时长 1200 秒约束；<code>demucs</code> 引擎无此限制</td></tr>
 </tbody>
 </table>
 
@@ -472,10 +478,55 @@ def _run_local(task_id, body, workdir, cls):
     }
 
 
+def _demucs_separate(task_id, src, workdir, wanted):
+    """直接跑 demucs。StemDeck 那条 pipeline 里 analyze / post / beatgrid 占掉
+    大半时间，出的却是 BPM、调性、节拍网格这类元数据，这里一概不要。"""
+    _progress(task_id, status="running", stage="Separating stems...")
+    out = os.path.join(workdir, "demucs")
+    cmd = [DEMUCS_PYTHON, "-m", "demucs", "-n", DEMUCS_MODEL,
+           "-d", DEMUCS_DEVICE, "-o", out, src]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=JOB_TIMEOUT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"demucs 退出码 {proc.returncode}：{proc.stderr.strip()[-400:]}")
+
+    stems = []
+    for root, _, files in os.walk(out):
+        for name in files:
+            stem = _stem_key(name)
+            if not name.lower().endswith(".wav") or stem not in STEM_NAMES:
+                continue
+            if wanted and stem not in wanted:
+                continue
+            dest = os.path.join(workdir, stem + ".wav")
+            shutil.move(os.path.join(root, name), dest)
+            stems.append({"name": stem, "bytes": _bytes(dest),
+                          "url": f"/result/{task_id}/{stem}.wav"})
+    if not stems:
+        raise RuntimeError(f"demucs 没有产出分轨，检查模型名 {DEMUCS_MODEL}")
+    stems.sort(key=lambda s: STEM_NAMES.index(s["name"]))
+
+    zip_path = os.path.join(workdir, "all.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:
+        for s in stems:
+            z.write(os.path.join(workdir, s["name"] + ".wav"), s["name"] + ".wav")
+    return {
+        "ok": True,
+        "taskId": task_id,
+        "status": "done",
+        "operation": "separate",
+        "duration": round(sf.info(os.path.join(workdir, stems[0]["name"] + ".wav")).duration, 3),
+        "stems": stems,
+        "zip": {"bytes": _bytes(zip_path), "url": f"/result/{task_id}/all.zip"},
+        "__upload": (zip_path, "application/zip"),
+    }
+
+
 def _run_separate(task_id, body, workdir):
     _progress(task_id, status="running", stage="Downloading source...")
     src = _resolve_in(body)
     wanted = [s for s in (body.get("stems") or []) if s in STEM_NAMES]
+    if DEMUCS_PYTHON:
+        return _demucs_separate(task_id, src, workdir, wanted)
 
     _progress(task_id, stage="Submitting to StemDeck...")
     job_id = sd_submit(src)
@@ -645,13 +696,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/capabilities":
             return self._json(200, capabilities())
         if path == "/health":
-            out = {"ok": True, "engine": "stemdeck", "engine_ok": False}
-            try:
-                h = sd_health()
-                out.update(engine_ok=True, version=h.get("version"),
-                           model=h.get("demucs_model"), device=h.get("demucs_device"))
-            except Exception as e:
-                out["engine_error"] = str(e)
+            if DEMUCS_PYTHON:
+                out = {"ok": True, "engine": "demucs",
+                       "engine_ok": os.path.isfile(DEMUCS_PYTHON),
+                       "model": DEMUCS_MODEL, "device": DEMUCS_DEVICE}
+            else:
+                out = {"ok": True, "engine": "stemdeck", "engine_ok": False}
+                try:
+                    h = sd_health()
+                    out.update(engine_ok=True, version=h.get("version"),
+                               model=h.get("demucs_model"), device=h.get("demucs_device"))
+                except Exception as e:
+                    out["engine_error"] = str(e)
             with _lock:
                 out["tasks"] = len(_jobs)
             return self._json(200, out)
@@ -708,7 +764,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    sys.stderr.write(f"local dsp server on http://{HOST}:{PORT} -> {STEMDECK}\n")
+    engine = f"demucs {DEMUCS_MODEL} on {DEMUCS_DEVICE}" if DEMUCS_PYTHON else STEMDECK
+    sys.stderr.write(f"local dsp server on http://{HOST}:{PORT} -> {engine}\n")
     server.serve_forever()
 
 
