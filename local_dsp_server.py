@@ -38,6 +38,14 @@ DEMUCS_PYTHON = os.environ.get("DSP_DEMUCS_PYTHON", "")
 DEMUCS_MODEL = os.environ.get("DSP_DEMUCS_MODEL", "htdemucs_6s")
 DEMUCS_DEVICE = os.environ.get("DSP_DEMUCS_DEVICE", "cuda")
 
+# 配齐 bucket/endpoint/ak/sk 就把结果直接推进 OSS，不再留本地也不依赖 /result
+OSS_BUCKET = os.environ.get("DSP_OSS_BUCKET", "")
+OSS_ENDPOINT = os.environ.get("DSP_OSS_ENDPOINT", "")
+OSS_AK = os.environ.get("DSP_OSS_AK", "")
+OSS_SK = os.environ.get("DSP_OSS_SK", "")
+OSS_PREFIX = os.environ.get("DSP_OSS_PREFIX", "stems")
+OSS_EXPIRES = int(os.environ.get("DSP_OSS_EXPIRES", str(7 * 24 * 3600)))
+
 # StemDeck 用自签证书，本机通信不走证书链校验
 _SSL = ssl._create_unverified_context()
 
@@ -294,7 +302,7 @@ DOCS = """<!doctype html>
 <tr><td>stems</td><td>array</td><td>音轨列表</td></tr>
 <tr><td>stems[].name</td><td>string</td><td>音轨名</td></tr>
 <tr><td>stems[].bytes</td><td>number</td><td>文件字节数</td></tr>
-<tr><td>stems[].url</td><td>string</td><td>下载路径</td></tr>
+<tr><td>stems[].url</td><td>string</td><td>下载地址，配置了 OSS 时为预签名 URL</td></tr>
 <tr><td>zip.bytes</td><td>number</td><td>打包文件字节数</td></tr>
 <tr><td>zip.url</td><td>string</td><td>打包下载路径</td></tr>
 <tr><td>deduplicated</td><td>boolean</td><td>是否为重复 taskId 的历史结果</td></tr>
@@ -416,6 +424,37 @@ def _upload(path, url, method, ctype):
                                           "Content-Length": str(len(raw))})
     with urllib.request.urlopen(req, timeout=600) as r:
         return r.status
+
+
+_oss_bucket_cache = [None]
+
+
+def _oss_bucket():
+    if _oss_bucket_cache[0] is None:
+        import oss2
+
+        if not (OSS_BUCKET and OSS_ENDPOINT and OSS_AK and OSS_SK):
+            raise RuntimeError("OSS 配置不全，需要 DSP_OSS_BUCKET / DSP_OSS_ENDPOINT / DSP_OSS_AK / DSP_OSS_SK")
+        endpoint = OSS_ENDPOINT if "://" in OSS_ENDPOINT else "https://" + OSS_ENDPOINT
+        _oss_bucket_cache[0] = oss2.Bucket(oss2.Auth(OSS_AK, OSS_SK), endpoint, OSS_BUCKET)
+    return _oss_bucket_cache[0]
+
+
+def _publish_oss(task_id, workdir, result):
+    """分轨和 zip 推进 OSS，把 url 换成预签名地址。容器里因此不需要保留结果文件。"""
+    bucket = _oss_bucket()
+    prefix = f"{OSS_PREFIX}/{task_id}"
+    for stem in result.get("stems") or []:
+        key = f"{prefix}/{stem['name']}.wav"
+        bucket.put_object_from_file(key, os.path.join(workdir, stem["name"] + ".wav"),
+                                    headers={"Content-Type": "audio/wav"})
+        stem["url"] = bucket.sign_url("GET", key, OSS_EXPIRES)
+    zip_path = os.path.join(workdir, "all.zip")
+    if os.path.isfile(zip_path):
+        key = f"{prefix}/all.zip"
+        bucket.put_object_from_file(key, zip_path, headers={"Content-Type": "application/zip"})
+        result["zip"]["url"] = bucket.sign_url("GET", key, OSS_EXPIRES)
+    return {"bucket": OSS_BUCKET, "prefix": prefix}
 
 
 def _stem_key(filename):
@@ -572,11 +611,15 @@ def run_task(task_id, body):
 
         result["seconds"] = round(time.time() - started, 2)
         result["deduplicated"] = False
+        if OSS_BUCKET and result.get("operation") == "separate":
+            result["oss"] = _publish_oss(task_id, workdir, result)
         upload = result.pop("__upload", None)
         if body.get("uploadUrl") and upload:
             result["uploadStatus"] = _upload(upload[0], body["uploadUrl"], body.get("uploadMethod"),
                                              upload[1])
             result["uploadUrl"] = body["uploadUrl"]
+        if OSS_BUCKET:
+            shutil.rmtree(workdir, ignore_errors=True)
         _progress(task_id, status="done", stage="Done", result=result, finished=time.time())
         return result
     except Exception as e:

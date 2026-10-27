@@ -1,0 +1,25 @@
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    TORCH_HOME=/models \
+    DSP_HOST=0.0.0.0 \
+    DSP_PORT=8765 \
+    DSP_DEMUCS_PYTHON=/opt/conda/bin/python \
+    DSP_DEMUCS_MODEL=htdemucs_6s
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libsndfile1 ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+# 权重烤进镜像，冷启动不用联网下载
+RUN pip install --no-cache-dir "demucs==4.0.1" soundfile pyloudnorm scipy oss2 \
+ && python -c "from demucs.pretrained import get_model; get_model('$DSP_DEMUCS_MODEL')" \
+ && rm -rf /root/.cache/pip
+
+WORKDIR /app
+COPY local_dsp_server.py ./
+COPY engines/ ./engines/
+
+EXPOSE 8765
+
+CMD ["python", "local_dsp_server.py"]
