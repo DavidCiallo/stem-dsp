@@ -182,6 +182,7 @@ DOCS = """<!doctype html>
 <tr><td>POST</td><td>/upload</td><td>上传源音频存档</td></tr>
 <tr><td>POST</td><td>/process</td><td>提交处理</td></tr>
 <tr><td>POST</td><td>/warmup</td><td>预热：跑一次 1 秒的分离</td></tr>
+<tr><td>POST</td><td>/initialize</td><td>预热，供函数计算 Initializer 调用</td></tr>
 <tr><td>GET</td><td>/task/{taskId}</td><td>任务状态</td></tr>
 <tr><td>GET</td><td>/tasks</td><td>最近任务</td></tr>
 <tr><td>GET</td><td>/result/{taskId}/out.wav</td><td>本地模块输出</td></tr>
@@ -208,8 +209,7 @@ DOCS = """<!doctype html>
 </table>
 
 <div class="endpoint"><span class="m post">POST</span><h2>/warmup</h2></div>
-<p class="note">需要鉴权。跑一次 1 秒音频的完整分离，把 torch、CUDA、模型加载这些一次性初始化做完，之后的任务只剩推理。容器首次启动要跑 50 秒左右，模型已加载时几秒返回。</p>
-<h3>响应</h3>
+<p class="note">需要鉴权。跑一次 1 秒音频的完整分离，把 torch、CUDA、模型加载这些一次性初始化做完，之后的任务只剩推理。容器首次启动要跑 50 秒左右，模型已加载时几秒返回。</p><h3>响应</h3>
 <table>
 <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
 <tbody>
@@ -219,6 +219,9 @@ DOCS = """<!doctype html>
 <tr><td>seconds</td><td>number</td><td>本次预热耗时</td></tr>
 </tbody>
 </table>
+
+<div class="endpoint"><span class="m post">POST</span><h2>/initialize</h2></div>
+<p class="note">无需鉴权。函数计算配置 Initializer 回调（调用代码类型）时，实例构建阶段会向容器发这个请求。行为与 <code>/warmup</code> 相同，成功返回 200，失败返回 500 让函数计算重建实例。</p>
 
 <div class="endpoint"><span class="m get">GET</span><h2>/capabilities</h2></div>
 <p class="note">需要鉴权。</p>
@@ -831,8 +834,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/process", "/separate", "/upload", "/warmup"):
+        if path not in ("/process", "/separate", "/upload", "/warmup", "/initialize"):
             return self._json(404, {"ok": False, "error": f"unknown path {path}"})
+        # FC 的 Initializer 不带我们的 token，也不能接受 4xx，这一条单独放行
+        if path == "/initialize":
+            try:
+                return self._json(200, _warmup())
+            except Exception as e:
+                sys.stderr.write(traceback.format_exc())
+                # 5xx 会让 FC 换一个实例重试，比带着坏实例上线强
+                return self._json(500, {"ok": False, "error": str(e)})
         if not self._authed():
             return self._json(401, {"ok": False, "error": "missing or wrong token"})
         try:
