@@ -1,0 +1,12 @@
+[Unit]
+Description=stem-dsp 启动通知
+After=network-online.target stem-dsp.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/stem-dsp-announce
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

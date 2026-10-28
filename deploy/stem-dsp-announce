@@ -1,0 +1,30 @@
+#!/bin/sh
+# 开机后向 stream-ready 汇报本实例的地址。
+# 安装：cp 到 /usr/local/bin/stem-dsp-announce && chmod +x，单元放 /etc/systemd/system/。
+[ -f /etc/stem-dsp.env ] && . /etc/stem-dsp.env
+
+META=http://100.100.100.200/latest/meta-data
+INSTANCE_ID=$(curl -s -m 5 $META/instance-id)
+REGION=$(curl -s -m 5 $META/region-id)
+ZONE=$(curl -s -m 5 $META/zone-id)
+PRIVATE_IP=$(curl -s -m 5 $META/private-ipv4)
+PUBLIC_IP=$(curl -s -m 8 https://ifconfig.me)
+
+BODY=$(printf '{"service":"stem-dsp","instanceId":"%s","region":"%s","zone":"%s","publicIp":"%s","privateIp":"%s","port":%s}' \
+  "$INSTANCE_ID" "$REGION" "$ZONE" "$PUBLIC_IP" "$PRIVATE_IP" "${DSP_PORT:-8765}")
+echo "announce: $BODY"
+
+for i in 1 2 3; do
+  # 站点对未知路径也会返回 200 的 HTML，所以要连 Content-Type 一起校验
+  resp=$(curl -sS -m 15 -w '\n%{http_code} %{content_type}' -X POST \
+    -H 'Content-Type: application/json' -d "$BODY" https://stream-ready.com/api/sync)
+  code=$(echo "$resp" | tail -1 | cut -d' ' -f1)
+  ctype=$(echo "$resp" | tail -1 | cut -d' ' -f2)
+  echo "attempt $i -> HTTP $code ($ctype)"
+  if [ "$code" = "200" ] && echo "$ctype" | grep -q json; then
+    echo "ok"
+    exit 0
+  fi
+  sleep 5
+done
+exit 1
