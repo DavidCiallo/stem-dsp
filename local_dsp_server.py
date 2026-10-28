@@ -272,7 +272,7 @@ DOCS = """<!doctype html>
 <tr><td>module</td><td>string</td><td class="req">否</td><td>本地引擎模块名，取值见 <code>/capabilities</code></td></tr>
 <tr><td>params</td><td>object</td><td class="req">否</td><td>模块参数，缺省项取 default</td></tr>
 <tr><td>fileId</td><td>string</td><td class="req">否</td><td>已存档音频的标识，由 <code>/upload</code> 返回</td></tr>
-<tr><td>sourceUrl</td><td>string</td><td class="req">否</td><td>源音频 HTTP(S) 地址，由服务端下载</td></tr>
+<tr><td>sourceUrl</td><td>string</td><td class="req">否</td><td>源音频 HTTP(S) 地址，由服务端下载。同地域 OSS 对象用内网 endpoint 签名</td></tr>
 <tr><td>path</td><td>string</td><td class="req">否</td><td>服务端本机文件路径</td></tr>
 <tr><td>audioBase64</td><td>string</td><td class="req">否</td><td>源音频 Base64</td></tr>
 <tr><td>format</td><td>string</td><td class="req">否</td><td><code>audioBase64</code> 解码格式，默认 <code>wav</code></td></tr>
@@ -284,6 +284,7 @@ DOCS = """<!doctype html>
 </tbody>
 </table>
 <p class="note"><code>fileId</code>、<code>sourceUrl</code>、<code>path</code>、<code>audioBase64</code> 四选一。模块的 <code>needsInput</code> 为 true 时必须提供其一。</p>
+<p class="note"><code>sourceUrl</code> 指向同地域 OSS 对象时，用内网 endpoint（<code>oss-&lt;region&gt;-internal.aliyuncs.com</code>）签名，服务端走内网读取。同区域实测 9.58 MB 文件内网 0.16 秒、公网 6.55 秒。</p>
 
 <h3>响应 · 本地模块</h3>
 <table>

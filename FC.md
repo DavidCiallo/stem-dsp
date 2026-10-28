@@ -118,7 +118,7 @@ Content-Type: application/json
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `fileId` | string | 二选一 | `/upload` 返回的文件标识 |
-| `sourceUrl` | string | 二选一 | 源音频下载地址 |
+| `sourceUrl` | string | 二选一 | 源音频下载地址，指向同地域 OSS 对象时用内网域名签名 |
 | `taskId` | string | 否 | 任务标识，缺省时自动生成 |
 | `stems` | array | 否 | 指定输出音轨，缺省输出全部六轨 |
 | `async` | boolean | 否 | 为 true 时立即返回任务状态，结果通过 `/task/{taskId}` 获取 |
@@ -192,6 +192,33 @@ ss3m/stems/qhc-v6/other.wav
 
 上传经由内网 endpoint 完成，预签名地址使用公网 endpoint 生成。地址有效期 7 天。
 
+### 6.1 endpoint 选择规则
+
+OSS 为同一存储空间提供内网与公网两个访问域名，选择依据是“谁访问”。
+
+| 访问方 | 用途 | endpoint |
+|---|---|---|
+| 服务端 | 读取 `sourceUrl` 指向的源音频 | 内网 |
+| 服务端 | 写入分离结果 | 内网 |
+| 客户端 | 生成交给服务端的 `sourceUrl` | 内网签名 |
+| 客户端 | 下载结果音轨 | 公网 |
+
+内网域名格式为 `oss-<region>-internal.aliyuncs.com`，公网为 `oss-<region>.aliyuncs.com`。
+
+签名由客户端本地计算，生成内网域名的预签名地址时，客户端访问该域名并非必要操作，任一持有 AccessKey 的进程均可完成。
+
+同一对象两种域名的读取耗时实测（9.58 MB，服务端与存储空间同区域）：
+
+| endpoint | 耗时 | 流量 |
+|---|---|---|
+| 内网 | 0.16 s | 内网流量 |
+| 公网 | 6.55 s | 公网流量，单独计费 |
+
+客户端侧规则：
+
+- 交给 `/process` 的 `sourceUrl`，用内网域名签名
+- 需要自己下载的地址，用公网域名签名（服务端返回的 `stems[].url` 已按此规则生成）
+
 ## 7. 性能数据
 
 测试音频：周杰伦《青花瓷》，MP3，9.14 MB，时长 239.5 秒。实例为 NVIDIA A10，模型已加载。
@@ -217,8 +244,10 @@ ss3m/stems/qhc-v6/other.wav
 
 ```
 1. 用户选择音频
-2. POST /warmup                        预热实例（异步发出，无需等待返回）
-3. POST /upload                        上传音频，取得 fileId
-4. POST /process {"fileId": "..."}     提交分离，取得六条预签名地址
-5. GET <stems[].url>                   下载各音轨
+2. 客户端上传音频到 OSS，取得内网域名签名的 sourceUrl
+3. POST /warmup                        预热实例（异步发出，无需等待返回）
+4. POST /process {"sourceUrl": "..."}  提交分离，取得六条预签名地址
+5. GET <stems[].url>                   下载各音轨（公网域名）
 ```
+
+采用 `sourceUrl` 提交时，音频经由客户端到 OSS 的一段传输，服务端从内网读取源文件。采用 `/upload` 提交时，音频直接到达服务端。
