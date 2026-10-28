@@ -134,9 +134,10 @@ Content-Type: application/json
   "duration": 239.511,
   "seconds": 6.9,
   "deduplicated": false,
-  "oss": {"bucket": "ss3m", "prefix": "stems/qhc-v6"},
+  "cached": false,
+  "oss": {"bucket": "ss3m", "prefix": "stems/1e1dc4122b5b47a4aada62006e080ed3"},
   "stems": [
-    {"name": "vocals", "bytes": 42249838, "url": "https://ss3m.oss-us-east-1.aliyuncs.com/stems%2Fqhc-v6%2Fvocals.wav?OSSAccessKeyId=...&Expires=...&Signature=..."},
+    {"name": "vocals", "bytes": 42249838, "url": "https://ss3m.oss-us-east-1.aliyuncs.com/stems%2F1e1dc412%2Fvocals.wav?OSSAccessKeyId=...&Expires=...&Signature=..."},
     {"name": "drums",  "bytes": 42249838, "url": "https://..."},
     {"name": "bass",   "bytes": 42249838, "url": "https://..."},
     {"name": "guitar", "bytes": 42249838, "url": "https://..."},
@@ -157,8 +158,9 @@ Content-Type: application/json
 | `duration` | number | 源音频时长，秒 |
 | `seconds` | number | 分离耗时，秒 |
 | `deduplicated` | boolean | 重复 taskId 返回历史结果时为 true |
+| `cached` | boolean | 同一源文件已分离过，本次复用缓存结果为 true |
 | `oss.bucket` | string | 存储空间名称 |
-| `oss.prefix` | string | 对象前缀 |
+| `oss.prefix` | string | 对象前缀，由源音频 SHA-256 摘要构成 |
 | `stems[].name` | string | 音轨名 |
 | `stems[].bytes` | number | 文件字节数 |
 | `stems[].url` | string | 预签名下载地址 |
@@ -179,20 +181,42 @@ POST /warmup
 
 ## 6. 结果存储
 
-分离结果写入 OSS，对象路径为 `{DSP_OSS_PREFIX}/{taskId}/{stem}.wav`，默认前缀 `stems`：
+分离结果写入 OSS，对象路径为 `{DSP_OSS_PREFIX}/{sha256}/{stem}.wav`，其中 `sha256` 为源音频内容的 SHA-256 摘要，默认前缀 `stems`：
 
 ```
-ss3m/stems/qhc-v6/vocals.wav
-ss3m/stems/qhc-v6/drums.wav
-ss3m/stems/qhc-v6/bass.wav
-ss3m/stems/qhc-v6/guitar.wav
-ss3m/stems/qhc-v6/piano.wav
-ss3m/stems/qhc-v6/other.wav
+ss3m/stems/1e1dc4122b5b47a4aada62006e080ed3.../vocals.wav
+ss3m/stems/1e1dc4122b5b47a4aada62006e080ed3.../drums.wav
+ss3m/stems/1e1dc4122b5b47a4aada62006e080ed3.../bass.wav
+ss3m/stems/1e1dc4122b5b47a4aada62006e080ed3.../guitar.wav
+ss3m/stems/1e1dc4122b5b47a4aada62006e080ed3.../piano.wav
+ss3m/stems/1e1dc4122b5b47a4aada62006e080ed3.../other.wav
 ```
+
+### 6.1 结果缓存
+
+对象名由源音频内容决定，同一文件再次提交时命中缓存，跳过推理。
+
+判定方式：服务端下载源文件后计算 SHA-256，按请求的 `stems` 逐个检查对象是否存在。全部存在时直接返回现有对象的预签名地址，响应中 `cached` 为 `true`。缺少任意一轨时执行完整分离。
+
+实测（15 秒音频）：
+
+| 请求 | 耗时 | `cached` |
+|---|---|---|
+| 首次 | 20.2 s | false |
+| 相同文件，不同 taskId | 1.5 s | true |
+
+### 6.2 存储回收
+
+存储空间配置生命周期规则，`stems/` 前缀下的对象在写入 30 天后自动删除。
+
+| 规则名 | 前缀 | 过期天数 | 状态 |
+|---|---|---|---|
+| `stem-dsp-30d` | `stems/` | 30 | Enabled |
+
 
 上传经由内网 endpoint 完成，预签名地址使用公网 endpoint 生成。地址有效期 7 天。
 
-### 6.1 endpoint 选择规则
+### 6.3 endpoint 选择规则
 
 OSS 为同一存储空间提供内网与公网两个访问域名，选择依据是“谁访问”。
 

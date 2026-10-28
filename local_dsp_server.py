@@ -7,6 +7,7 @@
 """
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -325,7 +326,8 @@ DOCS = """<!doctype html>
 <tr><td>stems[].url</td><td>string</td><td>下载地址，配置了 OSS 时为预签名 URL</td></tr>
 <tr><td>oss</td><td>object</td><td>结果在对象存储中的位置</td></tr>
 <tr><td>oss.bucket</td><td>string</td><td>存储空间名称</td></tr>
-<tr><td>oss.prefix</td><td>string</td><td>对象前缀，形如 <code>stems/{taskId}</code></td></tr>
+<tr><td>oss.prefix</td><td>string</td><td>对象前缀，形如 <code>stems/{sha256}</code>，由源音频内容摘要决定</td></tr>
+<tr><td>cached</td><td>boolean</td><td>同一源文件此前已分离，本次直接复用</td></tr>
 <tr><td>deduplicated</td><td>boolean</td><td>是否为重复 taskId 的历史结果</td></tr>
 <tr><td>uploadUrl</td><td>string</td><td>上传地址，仅在传入 uploadUrl 时出现</td></tr>
 <tr><td>uploadStatus</td><td>number</td><td>上传返回的 HTTP 状态码</td></tr>
@@ -471,17 +473,51 @@ def _oss_signer():
     return _oss_signer_cache[0]
 
 
-def _publish_oss(task_id, workdir, result):
-    """分轨和 zip 推进 OSS，把 url 换成预签名地址。容器里因此不需要保留结果文件。"""
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cache_prefix(digest):
+    return f"{OSS_PREFIX}/{digest}"
+
+
+def _cached_stems(digest, wanted):
+    """按源文件哈希找已有结果。缺任意一轨就当没有缓存，整单重跑。"""
+    import oss2
+
     bucket = _oss_bucket()
     signer = _oss_signer()
-    prefix = f"{OSS_PREFIX}/{task_id}"
+    stems = []
+    for name in STEM_NAMES:
+        if wanted and name not in wanted:
+            continue
+        key = f"{_cache_prefix(digest)}/{name}.wav"
+        try:
+            meta = bucket.head_object(key)
+        except oss2.exceptions.NoSuchKey:
+            return None
+        stems.append({"name": name, "bytes": meta.content_length,
+                      "url": signer.sign_url("GET", key, OSS_EXPIRES)})
+    return stems
+
+
+def _publish_oss(digest, workdir, result):
+    """分轨推进 OSS，把 url 换成预签名地址。容器里因此不需要保留结果文件。
+
+    对象名用源文件哈希，同一首歌重复提交直接命中缓存。
+    """
+    bucket = _oss_bucket()
+    signer = _oss_signer()
+    prefix = _cache_prefix(digest)
     for stem in result.get("stems") or []:
         key = f"{prefix}/{stem['name']}.wav"
         bucket.put_object_from_file(key, os.path.join(workdir, stem["name"] + ".wav"),
                                     headers={"Content-Type": "audio/wav"})
         stem["url"] = signer.sign_url("GET", key, OSS_EXPIRES)
-    return {"bucket": OSS_BUCKET, "prefix": prefix}
 
 
 def _stem_key(filename):
@@ -611,7 +647,24 @@ def _run_separate(task_id, body, workdir):
     src = _resolve_in(body)
     wanted = [s for s in (body.get("stems") or []) if s in STEM_NAMES]
     if DEMUCS_PYTHON:
-        return _demucs_separate(task_id, src, workdir, wanted)
+        digest = _sha256(src) if OSS_BUCKET else ""
+        if digest:
+            cached = _cached_stems(digest, wanted)
+            if cached:
+                _progress(task_id, stage="Cache hit")
+                return {
+                    "ok": True,
+                    "taskId": task_id,
+                    "status": "done",
+                    "operation": "separate",
+                    "duration": round(sf.info(src).duration, 3),
+                    "stems": cached,
+                    "cached": True,
+                    "__digest": digest,
+                }
+        result = _demucs_separate(task_id, src, workdir, wanted)
+        result["__digest"] = digest
+        return result
 
     _progress(task_id, stage="Submitting to StemDeck...")
     job_id = sd_submit(src)
@@ -655,8 +708,13 @@ def run_task(task_id, body):
 
         result["seconds"] = round(time.time() - started, 2)
         result["deduplicated"] = False
-        if OSS_BUCKET and result.get("operation") == "separate":
-            result["oss"] = _publish_oss(task_id, workdir, result)
+        digest = result.pop("__digest", "")
+        if result.get("operation") == "separate":
+            result["cached"] = bool(result.get("cached"))
+            if OSS_BUCKET and digest:
+                result["oss"] = {"bucket": OSS_BUCKET, "prefix": _cache_prefix(digest)}
+                if not result["cached"]:
+                    _publish_oss(digest, workdir, result)
         upload = result.pop("__upload", None)
         if body.get("uploadUrl") and upload:
             result["uploadStatus"] = _upload(upload[0], body["uploadUrl"], body.get("uploadMethod"),
